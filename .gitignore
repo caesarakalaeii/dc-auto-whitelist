@@ -1,0 +1,5 @@
+#ignore vs code shit
+.vs*
+
+#ignore the config files
+config.py
