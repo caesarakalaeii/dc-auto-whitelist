@@ -4,3 +4,15 @@
 #ignore the config files
 
 config.py
+
+#ignore nix + direnv build artifacts
+.direnv/
+result
+result-*
+
+#ignore python bytecode
+__pycache__/
+*.pyc
+
+#ignore runtime state written by the bot
+whitelist.json
