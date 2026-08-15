@@ -14,5 +14,8 @@ result-*
 __pycache__/
 *.pyc
 
+#ignore ruff's cache: the flake's verbs pass --no-cache, a bare `ruff` run does not
+.ruff_cache/
+
 #ignore runtime state written by the bot
 whitelist.json
