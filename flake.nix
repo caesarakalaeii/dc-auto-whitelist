@@ -134,6 +134,14 @@
       # network bootstrap. `nix flake show` therefore reports the truth. A stub
       # that echoed "not applicable" would turn the command map into a liar --
       # do not add one; add a real verb when the repo earns it.
+      #
+      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time. It
+      # starts in the caller's current directory but must never ACT on it: a
+      # bare trailing "$@" is a bug, because with no arguments the tool then
+      # defaults to `.`. Anchor the no-argument case to $REPO_ROOT or cd there
+      # first, and anything that WRITES calls need_writable_checkout before it
+      # does, because $REPO_ROOT can legitimately be the read-only store
+      # snapshot (see rootPreamble and guardPreamble below).
       commands = pkgs: {
         run = {
           # `python3` unqualified is correct HERE, and only because of the
@@ -146,13 +154,17 @@
           # bare relative path, so without the cd an agent invoking the bot from
           # a subdirectory would quietly start a second, empty whitelist.
           #
-          # The cd was never the weak part -- $REPO_ROOT was. Until the anchor in
-          # rootPreamble was fixed this line could cd into whatever unrelated git
-          # checkout the caller happened to be standing in and write
-          # whitelist.json there. Started outside any checkout of this repo the
-          # anchor is now the read-only store copy, where the first whitelist
-          # write raises OSError 30 -- loud, immediate, and confined to this repo
-          # rather than silently forking state into a stranger's tree.
+          # The cd was never the weak part -- $REPO_ROOT was. Until rootPreamble
+          # started proving a candidate is a checkout of THIS flake, this line
+          # would cd into whatever unrelated git checkout the caller happened to
+          # be standing in and write whitelist.json there.
+          #
+          # need_writable_checkout runs first and unconditionally, unlike in
+          # `fmt`: whitelist.json is written no matter what arguments are passed,
+          # so a $REPO_ROOT pointing at the read-only store snapshot cannot work.
+          # Left to itself the bot would run for however long it takes someone to
+          # type `!whitelist` and then die with OSError 30 mid-session; refusing
+          # up front says the same thing immediately.
           #
           # KNOWN GAP, and it is the repo's, not the flake's -- do not go hunting
           # in here for it. bot.py is written against the discord.py 1.x API, but
@@ -167,6 +179,7 @@
           # `from rcon import Client` was checked too and is still fine on 2.4.9.
           description = "start the Discord bot (needs a real config.py; bot.py needs a discord.py 2.x fix first)";
           text = ''
+            need_writable_checkout
             cd "$REPO_ROOT"
             python3 bot.py "$@"
           '';
@@ -211,49 +224,30 @@
           # directory, the bare "$@" version reformatted the files sitting in
           # that directory -- reproduced, not theorised.
           #
-          # The guard covers the one case an anchor cannot rescue: started
-          # outside any checkout of this repo, $REPO_ROOT is the flake's own
-          # source in the store, which is read-only by construction. That is the
-          # safe answer -- nothing outside this repo can be written -- but
-          # without the guard ruff emits one "Read-only file system (os error
-          # 30)" per file and exits 2, which reads like a broken flake instead of
-          # a misuse. Refuse once, saying why. Explicit paths are the caller's
-          # business, so the guard stands down as soon as there are any.
+          # need_writable_checkout covers the one case an anchor cannot rescue:
+          # started outside any checkout of this repo, $REPO_ROOT is the flake's
+          # own source in the store, which is read-only by construction. That is
+          # the safe answer -- nothing outside this repo can be written -- but
+          # left alone ruff emits one "Read-only file system (os error 30)" per
+          # file and exits 2, which reads like a broken flake instead of a
+          # misuse. Refuse once, saying why.
+          #
+          # `set --` rather than an inline "''${@:-...}" so the guard runs in the
+          # no-argument branch only: an explicit path is the caller's own
+          # instruction and is forwarded untouched.
           text = ''
-            if [ "$#" -eq 0 ] && [ ! -w "$REPO_ROOT" ]; then
-              echo "dev-fmt: refusing to format $REPO_ROOT -- it is the read-only store copy of this repo." >&2
-              echo "dev-fmt: run it from a checkout, or pass REPO_ROOT=/path/to/checkout, or name paths explicitly." >&2
-              exit 1
+            if [ "$#" -eq 0 ]; then
+              need_writable_checkout
+              set -- "$REPO_ROOT"
             fi
-            ruff format --no-cache "''${@:-$REPO_ROOT}"
+            ruff format --no-cache "$@"
           '';
         };
       };
 
       # ======================================================================
-      # PER-REPO BLOCK 5 -- the anchor sentinel
+      # GENERIC MACHINERY -- byte-identical in all 41 repos, do not edit
       # ======================================================================
-      # One tracked file that exists in THIS repo and would not exist in a
-      # sibling. rootPreamble below refuses to point a verb at a directory that
-      # does not carry it, and falls back to the read-only store copy instead.
-      # That test is what keeps `nix run /path/to/repo#fmt`, launched from inside
-      # some other checkout, from reformatting that other checkout.
-      #
-      # bot.py is the entire program, so it cannot quietly vanish -- but if it is
-      # ever renamed, rename it here in the same commit. The failure mode is safe
-      # and loud rather than destructive: `dev-fmt` inside a real checkout starts
-      # refusing with "read-only store copy" because the anchor fell through.
-      #
-      # Do NOT relax this to flake.nix, .git or README.md. Every repo in the
-      # fleet has those, and "this is a repo" is precisely the mistake the
-      # sentinel exists to stop; it has to mean "this is *that* repo".
-      anchorFile = "bot.py";
-
-      # ======================================================================
-      # GENERIC MACHINERY -- byte-identical across the fleet, do not edit
-      # ======================================================================
-      # (rootPreamble reads `anchorFile` from BLOCK 5. That one name is the only
-      # per-repo input this section takes; everything else here is fleet code.)
 
       # Prepend, never assign: a host LD_LIBRARY_PATH may be carrying something
       # the user needs, and clobbering it breaks binaries they launch from here.
@@ -266,45 +260,68 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # $REPO_ROOT is the anchor every verb acts on, and resolving it must not
-      # trust the caller's cwd. `nix run` and `nix develop` both start in whatever
-      # directory they were invoked from, so the previous
-      #   REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-      # answered with the CALLER's repo -- or, outside a repo, with the caller's
-      # bare cwd. Every verb inherited that mistake: `#lint` graded a directory
-      # holding none of this repo's files and passed, `#fmt` rewrote one.
+      # Every command gets $SRC_ROOT and $REPO_ROOT. `nix run` and `nix develop`
+      # both start in whatever directory they were invoked from, and no verb may
+      # act on that directory -- these two are what it acts on instead.
       #
-      # Resolution order, first hit wins:
-      #   1. an inherited $REPO_ROOT. This is how a wrapper started from inside
-      #      `nix develop` keeps acting on the work tree (the shellHook ran this
-      #      same preamble there), and it doubles as the documented escape hatch
-      #      for `REPO_ROOT=/path/to/checkout nix run /elsewhere#fmt`.
-      #   2. the git work tree the caller is standing in, which makes plain
-      #      `nix run .#fmt` and `dev-fmt` from a subdirectory edit the files the
-      #      developer is actually looking at.
-      #   3. `self`, this flake's own source, baked into every wrapper at build
-      #      time. Always the right files, never writable -- so a mutating verb
-      #      that lands here can damage nothing and says so (see `fmt`).
+      # $SRC_ROOT is this flake's own source, snapshotted into the store when
+      # the flake was evaluated. It is the one anchor that is always available:
+      # `nix run /path/to/repo#lint` tells the running program nothing whatever
+      # about /path/to/repo (flake refs are location-independent by design, and
+      # there is no $FLAKE_DIR to read), so without `self` a wrapper invoked
+      # that way has literally no way to name the repo it belongs to. Its one
+      # limitation is that it is read-only, being a store path.
       #
-      # 1 and 2 are candidates, not answers: each has to carry ${anchorFile}
-      # before it is accepted. That check is the entire safety property. Without
-      # it, case 2 is the old bug and case 1 is a new one -- every repo in the
-      # fleet exports REPO_ROOT, so one repo's `#fmt` would happily reformat
-      # another's checkout. Anything that fails the check falls through to 3.
+      # $REPO_ROOT is the writable checkout when the caller is standing in one,
+      # and $SRC_ROOT when they are not. `git rev-parse --show-toplevel` alone
+      # is NOT enough to find that checkout: run from inside some OTHER git
+      # repo it cheerfully answers with THAT repo's top level, and a verb that
+      # trusts the answer formats a stranger's source tree. So a candidate has
+      # to prove it is a checkout of this flake, by carrying a byte-identical
+      # flake.nix. Compared with bash's own $(<file) rather than cmp or
+      # sha256sum, so the check depends on no package at all.
       #
-      # Runs in a subshell so the loop variable does not leak into the
-      # interactive shell that sources this via shellHook.
+      # A single tracked filename is NOT enough proof either, and that was this
+      # repo's own bug: keyed on a root bot.py, the anchor accepted five sibling
+      # checkouts in this fleet that happen to ship one, and `nix run
+      # /path/to/dc-auto-whitelist#lint` from inside dc-bot graded dc-bot. Only
+      # the whole flake.nix distinguishes repos -- description, toolchain and
+      # command map all differ -- so only the whole flake.nix is compared.
+      #
+      # Consequence worth knowing: edit flake.nix and the dev-* wrappers in an
+      # already-open `nix develop` stop recognising the tree, because they were
+      # built from the previous flake.nix. That is a stale shell telling you so
+      # -- re-enter it. `nix run` re-evaluates every time and never sees this.
       rootPreamble = ''
-        REPO_ROOT="$(
-          for candidate in "''${REPO_ROOT:-}" "$(git rev-parse --show-toplevel 2>/dev/null)"; do
-            if [ -n "$candidate" ] && [ -e "$candidate/${anchorFile}" ]; then
-              printf '%s\n' "$candidate"
-              exit 0
-            fi
-          done
-          printf '%s\n' "${self}"
-        )"
+        SRC_ROOT=${lib.escapeShellArg self}
+        export SRC_ROOT
+        REPO_ROOT="$SRC_ROOT"
+        _toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$_toplevel" ] && [ -f "$_toplevel/flake.nix" ] &&
+          [ "$(<"$_toplevel/flake.nix")" = "$(<"$SRC_ROOT/flake.nix")" ]; then
+          REPO_ROOT="$_toplevel"
+        fi
+        unset _toplevel
         export REPO_ROOT
+      '';
+
+      # Wrappers only, not the shellHook -- an interactive shell has no business
+      # carrying this function around. Any command text that writes files calls
+      # it first, and it is the reason a mutating verb can fail loudly instead of
+      # falling back to "well, the cwd then".
+      guardPreamble = ''
+        need_writable_checkout() {
+          if [ "$REPO_ROOT" != "$SRC_ROOT" ]; then
+            return 0
+          fi
+          echo "This command rewrites files, so it needs a writable checkout of" >&2
+          echo "this repo -- and standing in $PWD there is none: no parent" >&2
+          echo "directory is a checkout of this flake. The only tree in reach is" >&2
+          echo "the read-only store snapshot $SRC_ROOT, and rewriting $PWD" >&2
+          echo "instead is exactly the bug this guard exists to prevent." >&2
+          echo "cd into the repo (or \`nix develop\` it), or pass an explicit path." >&2
+          exit 1
+        }
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -322,6 +339,7 @@
             meta.description = cmd.description;
             text = ''
               ${rootPreamble}
+              ${guardPreamble}
               ${ldPreamble pkgs}
               ${cmd.text}
             '';
@@ -438,52 +456,111 @@
               touch "$out"
             '';
 
-        # The regression gate for the defect this flake shipped with: a verb must
-        # act on THIS repo whatever directory it was started from. The probe
-        # directory below plays the caller's cwd -- an agent's $HOME, a sibling
-        # checkout, /tmp -- and holds a file ruff has plenty to say about and
-        # would gladly rewrite. It is deliberately not a git repo, because that is
-        # the case that used to end in `pwd`.
+        # The regression gate for the two defects this flake shipped with: a verb
+        # must act on THIS repo whatever directory it was started from, and "THIS
+        # repo" has to mean this repo rather than merely "some git checkout".
+        #
+        # Probe 1 is what the previous version of this check was missing. It is a
+        # REAL git repo carrying a root bot.py -- the exact shape of the five
+        # sibling checkouts in this fleet that also ship one (dc-bot,
+        # dc-confessions, dc-ranked_queue, quote-bot, streamer_shield_dc). The
+        # old probe was deliberately NOT a git repo, so it fell back to the store
+        # copy for the wrong reason and went green while `nix run
+        # /path/to/this#lint` run from inside dc-bot graded dc-bot's 61 findings.
+        # A probe that cannot reach the buggy branch is not a gate.
+        #
+        # Probe 2 is the other half, and without it a guard that refused
+        # everything would pass: a checkout whose flake.nix IS byte-identical
+        # must still be adopted, or every verb in the repo is dead.
         #
         # Note what is NOT asserted: dev-lint's exit code. It is 1 today because
         # bot.py has seven real findings, and it flips to 0 the day someone fixes
-        # them -- pinning it would make good news look like a broken check. Both
-        # assertions below survive that: lint must say nothing about the probe
-        # file, and fmt must not change a byte of it.
+        # them -- pinning it would make good news look like a broken check. The
+        # assertions below survive that: what the verbs read and wrote is the
+        # signal, plus dev-fmt's refusal, which does not depend on findings.
         #
-        # `run` shares the same anchor by construction (`cd "$REPO_ROOT"`) and is
-        # not probed here: it needs a Discord token and a network, neither of
-        # which exists in a build sandbox.
+        # `run` is not probed: it needs a Discord token and a network, neither of
+        # which exists in a build sandbox. It reaches the work tree through the
+        # same two lines probe 1 exercises (`need_writable_checkout`, then `cd
+        # "$REPO_ROOT"`), so dev-fmt refusing there is dev-run refusing there.
         anchoring =
           pkgs.runCommand "anchoring-check"
             {
-              nativeBuildInputs = lib.attrValues (wrappers pkgs);
+              nativeBuildInputs = [ pkgs.git ] ++ lib.attrValues (wrappers pkgs);
             }
             ''
               # The wrappers' last-resort anchor is this flake's own source, so
-              # assert it is really in the sandbox. Otherwise ruff would fail on a
-              # missing path, mention no file at all, and both greps below would
-              # "pass" while proving nothing.
-              test -e ${self}/${anchorFile}
+              # assert it is really in the sandbox -- and that it carries the
+              # flake.nix the anchor compares against. Otherwise ruff would fail
+              # on a missing path, mention no file at all, and every grep below
+              # would "pass" while proving nothing.
+              test -e ${self}/flake.nix
+              test -e ${self}/bot.py
 
-              mkdir probe
-              cd probe
-              printf 'import os,sys\nx=1\n' > decoy.py
-              cp decoy.py decoy.py.orig
+              # git wants somewhere to look for config, and the sandbox has no
+              # $HOME. Pointing both scopes at /dev/null also keeps the outcome
+              # independent of whatever the builder's git happens to inherit.
+              export HOME="$PWD"
+              export GIT_CONFIG_GLOBAL=/dev/null
+              export GIT_CONFIG_SYSTEM=/dev/null
 
-              # Both verbs are expected to be unhappy in here -- lint reports the
-              # repo's real findings, fmt refuses the read-only store copy -- so
-              # neither exit code is the signal. What they touched is.
+              # ---- probe 1: a sibling checkout must NOT be adopted ----
+              # Same sentinel filename this repo's guard used to key on, plus a
+              # flake.nix that differs -- which is exactly what a sibling is.
+              mkdir decoy
+              cd decoy
+              git init -q -b main .
+              printf 'import os,sys\nx=1\n' > bot.py
+              printf 'import json\ny=2\n' > sibling_only.py
+              printf '{\n  description = "a different repo";\n  outputs = _: { };\n}\n' > flake.nix
+              cp -r . ../decoy.orig
+
+              # Grepped for by NAME, not by directory: when the anchor wrongly
+              # lands on the decoy, ruff is also standing in it and prints its
+              # findings as bare relative paths, so a grep for "decoy" matches
+              # nothing and the leak sails through. A filename this repo does
+              # not contain is the thing that cannot be spelled both ways.
               dev-lint > lint.log 2>&1 || true
-              if grep -q decoy.py lint.log; then
-                echo "dev-lint inspected the caller's cwd instead of the repo:" >&2
+              if grep -q sibling_only lint.log; then
+                echo "dev-lint graded the sibling checkout instead of this repo:" >&2
+                cat lint.log >&2
+                exit 1
+              fi
+              if ! grep -q ${self} lint.log; then
+                echo "dev-lint reported on neither the sibling nor this repo:" >&2
                 cat lint.log >&2
                 exit 1
               fi
 
-              dev-fmt > fmt.log 2>&1 || true
-              if ! cmp -s decoy.py decoy.py.orig; then
-                echo "dev-fmt rewrote a file outside the repo:" >&2
+              # Refusal, not silence: fmt reaching the read-only store snapshot
+              # must exit non-zero. A zero exit here would mean it found a tree
+              # it believed was writable, and the only one in reach is the decoy.
+              if dev-fmt > fmt.log 2>&1; then
+                echo "dev-fmt succeeded inside a sibling checkout; it must refuse:" >&2
+                cat fmt.log >&2
+                exit 1
+              fi
+
+              # Not one byte rewritten and not one file added -- .ruff_cache
+              # included, which is why this is a whole-tree diff and not a cmp.
+              if ! diff -r --exclude=.git --exclude='*.log' . ../decoy.orig; then
+                echo "the verbs modified the sibling checkout:" >&2
+                exit 1
+              fi
+
+              # ---- probe 2: a real checkout of THIS repo must be adopted ----
+              cd ..
+              cp -r ${self} checkout
+              chmod -R u+w checkout
+              cd checkout
+              git init -q -b main .
+
+              # dev-fmt is the assertion. It calls need_writable_checkout, which
+              # passes only when $REPO_ROOT moved off the store snapshot onto
+              # this tree -- so a zero exit here is the acceptance path working,
+              # and it is the case probe 1 must not be allowed to break.
+              if ! dev-fmt > fmt.log 2>&1; then
+                echo "dev-fmt refused a byte-identical checkout of this repo:" >&2
                 cat fmt.log >&2
                 exit 1
               fi
